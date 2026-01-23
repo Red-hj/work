@@ -55,7 +55,7 @@ for name in os.listdir(date):
     denoised = np.clip(denoised,0,1)
 
     # 保存去噪后的图像
-    denoised_save_name = f"{img_name_base}_mixed_denoised.png"
+    denoised_save_name = f"{img_name_base}_denoised.png"
     denoised_save_path = os.path.join(result, denoised_save_name)
     cv2.imwrite(denoised_save_path,(denoised * 255).astype(np.uint8))
 
