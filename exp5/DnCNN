@@ -1,0 +1,238 @@
+import os
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import time
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+from torch.utils.data import Dataset
+
+device = torch.device("cuda")
+
+log_dir = r"E:\explore\DnCNN\logs_train"
+result_dir = r"E:\explore\DnCNN\result"
+model_path = r"E:\explore\DnCNN\modle"
+# noisy_dir = r"E:\explore\DnCNN\zaoseng"
+
+batch_size = 32
+epochs = 60
+learning_rate = 1e-3
+weight_decay = 1e-4  #权重衰减：L2正则化系数，防止过拟合
+gaussian_sigma = 25
+salt_pepper_amount = 0.02
+
+writer = SummaryWriter(log_dir=log_dir)
+
+transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,),(0.5,))
+])
+
+# train_dataset = datasets.FashionMNIST(root='./data',train=True,download=True,transform=transform)
+# test_dataset = datasets.FashionMNIST(root='./data',train=False,download=True,transform=transform)
+# train_loader = DataLoader(train_dataset,batch_size=batch_size,shuffle=True,num_workers=0)
+# test_loader = DataLoader(test_dataset,batch_size=batch_size,shuffle=False,num_workers=0)
+
+
+class Set14Dataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.data_dir = data_dir
+        self.transform = transform
+        self.img_paths = [
+            os.path.join(data_dir, f) for f in os.listdir(data_dir)
+            if f.endswith(('.png', '.jpg', '.jpeg'))
+        ]
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        img = transforms.ToPILImage()(img)
+        if self.transform:
+            img = self.transform(img)
+        return img, os.path.basename(img_path)
+
+set14_dir = r"E:\explore\set14"
+
+test_dataset = Set14Dataset(data_dir=set14_dir, transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+def add_mixed_noise(image, sigma=25, salt=0.02):
+    if isinstance(image, torch.Tensor):
+        img_np = image.cpu().numpy().squeeze(1)
+    else:
+        img_np = image.copy()
+
+    gaussian_noise = np.random.normal(0, sigma / 255.0, img_np.shape)
+    noisy_img = img_np + gaussian_noise
+    noisy_img = np.clip(noisy_img, -1, 1)
+    ans = np.copy(noisy_img)
+    batch_size, h, w = ans.shape
+
+    num1 = np.ceil(salt * ans.size * 0.5).astype(int)
+    t = [np.random.randint(0, i, num1) for i in (batch_size, h, w)]
+    ans[t[0], t[1], t[2]] = 1.0
+
+    num2 = np.ceil(salt * ans.size * 0.5).astype(int)
+    t = [np.random.randint(0, i, num2) for i in (batch_size, h, w)]
+    ans[t[0], t[1], t[2]] = -1.0
+
+    if isinstance(image, torch.Tensor):
+        ans = torch.from_numpy(ans).unsqueeze(1).float().to(device)
+        return ans
+    return ans
+
+
+class DnCNN(nn.Module):
+    def __init__(self, channels=1, num_layers=17):
+        super(DnCNN, self).__init__()
+        kernel_size = 3
+        padding = 1
+        features = 64
+
+        layers = [nn.Conv2d(channels, features, kernel_size, padding=padding, bias=False),
+                  nn.ReLU(inplace=True)]
+
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv2d(features, features, kernel_size, padding=padding, bias=False))
+            layers.append(nn.BatchNorm2d(features))
+            layers.append(nn.ReLU(inplace=True))
+
+        layers.append(nn.Conv2d(features, channels, kernel_size, padding=padding, bias=False))
+
+        self.dncnn = nn.Sequential(*layers)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        residual = self.dncnn(x)
+        denoised = x - residual
+        return denoised
+
+def train(model, criterion, optimizer, train_loader, epoch):
+    model.train()
+    epoch_start = time.time()
+    train_psnr = 0.0
+    train_ssim = 0.0
+    batch_count = 0
+
+    for batch_idx, (data, _) in enumerate(train_loader):
+
+        clean_img = data.to(device)
+        noisy_img = add_mixed_noise(clean_img, gaussian_sigma, salt_pepper_amount)
+        denoised_img = model(noisy_img)
+        loss = criterion(denoised_img, clean_img)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        clean_np = (clean_img.cpu().detach().numpy() + 1) / 2
+        denoised_np = (denoised_img.cpu().detach().numpy() + 1) / 2
+        for c, d in zip(clean_np, denoised_np):
+            c = c.squeeze()
+            d = d.squeeze()
+            train_psnr += psnr(c, d, data_range=1.0)
+            train_ssim += ssim(c, d, data_range=1.0)
+        batch_count += 1
+
+    avg_train_psnr = train_psnr / (batch_count * batch_size)
+    avg_train_ssim = train_ssim / (batch_count * batch_size)
+    epoch_time = round(time.time() - epoch_start, 4)
+
+    writer.add_scalar('Train/Loss', loss.item(), epoch)
+    writer.add_scalar('Train/PSNR', avg_train_psnr, epoch)
+    writer.add_scalar('Train/SSIM', avg_train_ssim, epoch)
+    writer.add_scalar('Train/Epoch_Time', epoch_time, epoch)
+
+    print(f"第 {epoch + 1}轮训练\n")
+    print(f"Loss: {loss.item():.4f}   PSNR: {avg_train_psnr:.2f} dB   SSIM: {avg_train_ssim:.4f}\n")
+    print(f"训练耗时: {epoch_time:.4f} s\n")
+    return avg_train_psnr, avg_train_ssim
+
+# 测试函数（适配Set14，仅修改保存逻辑）
+def test(model, criterion, test_loader):
+    model.eval()
+    test_psnr = 0.0
+    test_ssim = 0.0
+    img_count = 0
+
+    with torch.no_grad():
+        for batch_idx, (data, img_name) in enumerate(test_loader):
+            clean_img = data.to(device)
+            noisy_img = add_mixed_noise(clean_img, gaussian_sigma, salt_pepper_amount)
+            noisy_img_save = noisy_img
+            denoised_img = model(noisy_img)
+
+            clean_np = (clean_img[0].cpu().numpy().squeeze() + 1) / 2 * 255
+            noisy_np = (noisy_img_save[0].cpu().numpy().squeeze() + 1) / 2 * 255
+            denoised_np = (denoised_img[0].cpu().numpy().squeeze() + 1) / 2 * 255
+
+            cv2.imwrite(os.path.join(result_dir, f"{img_name[0]}_clean.png"), clean_np.astype(np.uint8))
+            cv2.imwrite(os.path.join(result_dir, f"{img_name[0]}_noisy.png"), noisy_np.astype(np.uint8))
+            cv2.imwrite(os.path.join(result_dir, f"{img_name[0]}_denoised.png"), denoised_np.astype(np.uint8))
+
+            # 计算PSNR/SSIM
+            clean_np = (clean_img.cpu().numpy() + 1) / 2
+            denoised_np = (denoised_img.cpu().numpy() + 1) / 2
+            for c, d in zip(clean_np, denoised_np):
+                c = c.squeeze()
+                d = d.squeeze()
+                test_psnr += psnr(c, d, data_range=1.0)
+                test_ssim += ssim(c, d, data_range=1.0)
+            img_count += 1
+
+    avg_test_psnr = test_psnr / img_count
+    avg_test_ssim = test_ssim / img_count
+    # writer.add_scalar('Test/PSNR',avg_test_psnr)
+    # writer.add_scalar('Test/SSIM',avg_test_ssim)
+    # writer.add_scalar('Test/Total_Time',test_time)
+
+    print(f"----测试 PSNR: {avg_test_psnr:.2f} dB  SSIM: {avg_test_ssim:.4f}")
+    return avg_test_psnr, avg_test_ssim
+
+if __name__ == "__main__":
+    model = DnCNN(channels=1).to(device)
+    model.load_state_dict(torch.load(os.path.join(model_path, "dncnn.pth"), map_location=device))
+    model.eval()
+    criterion = nn.MSELoss()
+
+    # print("Starting Training...")
+    # total_train_time = time.time()
+    # for epoch in range(epochs):
+    #     avg_train_psnr, avg_train_ssim = train(model, criterion, optimizer, train_loader, epoch)
+    # total_train_time = round(time.time() - total_train_time, 4)
+    # writer.add_scalar('Train/Total_Time', total_train_time)
+    # print(f"总时长: {total_train_time:.4f} s")
+
+    print("\ntest")
+    avg_test_psnr, avg_test_ssim = test(model, criterion, test_loader)
+
+    # writer.add_hparams({
+    #     'lr': learning_rate,
+    #     'batch_size': batch_size,
+    #     'sigma': gaussian_sigma,
+    #     'salt_pepper': salt_pepper_amount
+    # }, {
+    #     'final_train_psnr': avg_train_psnr,
+    #     'final_train_ssim': avg_train_ssim,
+    #     'final_test_psnr': avg_test_psnr,
+    #     'final_test_ssim': avg_test_ssim
+    # })
+    # torch.save(model.state_dict(), os.path.join(model_path,"dncnn.pth"))
+    # writer.close()
