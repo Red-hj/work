@@ -165,7 +165,7 @@ def train(model, criterion, optimizer, train_loader, epoch):
     print(f"训练耗时: {epoch_time:.4f} s\n")
     return avg_train_psnr, avg_train_ssim
 
-# 测试函数（适配Set14，仅修改保存逻辑）
+#测试函数
 def test(model, criterion, test_loader):
     model.eval()
     test_psnr = 0.0
