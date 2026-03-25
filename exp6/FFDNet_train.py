@@ -26,6 +26,7 @@ sigma_min = 5
 sigma_max = 50
 salt_pepper_amount = 0.03
 
+
 writer = SummaryWriter(log_dir=log_dir)
 
 def pad_to_even(x):
@@ -47,7 +48,7 @@ test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, trans
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-def add_mixed_noise(image, sigma=25, salt_pepper_amount=0.03):
+def add_noisy(image, sigma=25):
     if isinstance(image, torch.Tensor):
         img_np = image.cpu().numpy().squeeze(1)
     else:
@@ -55,9 +56,6 @@ def add_mixed_noise(image, sigma=25, salt_pepper_amount=0.03):
 
     gaussian_noise = np.random.normal(0, sigma / 255.0, img_np.shape)
     noisy_img = img_np + gaussian_noise
-    sp_mask = np.random.rand(*img_np.shape)
-    noisy_img[sp_mask < salt_pepper_amount / 2] = -1.0
-    noisy_img[sp_mask > 1 - salt_pepper_amount / 2] = 1.0
     noisy_img = np.clip(noisy_img, -1, 1)
 
     if isinstance(image, torch.Tensor):
@@ -120,7 +118,7 @@ def train(model, criterion, optimizer, train_loader, epoch):
     for batch_idx, (data, _) in enumerate(train_loader):
         clean_img = data.to(device)
         sigma_val = np.random.uniform(sigma_min, sigma_max)
-        noisy_img = add_mixed_noise(clean_img, sigma_val, salt_pepper_amount)
+        noisy_img = add_noisy(clean_img, sigma_val)
         sigma_tensor = torch.full((clean_img.size(0), 1, 1, 1), sigma_val / 255.0).to(device)
         denoised_img = model((noisy_img, sigma_tensor))
         loss = criterion(denoised_img, clean_img)
@@ -165,7 +163,7 @@ def test(model, criterion, test_loader):
         for batch_idx, (data, _) in enumerate(test_loader):
             clean_img = data.to(device)
             sigma_test = 35
-            noisy_img = add_mixed_noise(clean_img, sigma_test, salt_pepper_amount)
+            noisy_img = add_noisy(clean_img, sigma_test)
             noisy_img_save = noisy_img
             sigma_tensor = torch.full((clean_img.size(0), 1, 1, 1), sigma_test / 255.0).to(device)
             denoised_img = model((noisy_img, sigma_tensor))
