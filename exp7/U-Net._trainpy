@@ -1,0 +1,265 @@
+import os
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import time
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+from PIL import Image
+
+device = torch.device("cuda")
+
+log_dir = r"E:\explore\U-Net\logs_train"
+result_dir = r"E:\explore\U-Net\result"
+model_path = r"E:\explore\U-Net\model"
+div2k_path = r"E:\explore\data\DIV2K"
+
+batch_size = 32
+epochs = 100
+learning_rate = 1e-4
+sigma = 25
+repeat = 10
+
+writer = SummaryWriter(log_dir=log_dir)
+
+
+def pad_to_16(x):
+    h, w = x.shape[-2:]
+    pad_h = (16 - h % 16) % 16
+    pad_w = (16 - w % 16) % 16
+    return nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+
+
+train_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.RandomCrop(128),
+    transforms.ToTensor(),
+    transforms.Lambda(pad_to_16)
+])
+
+test_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.CenterCrop(256),
+    transforms.ToTensor(),
+    transforms.Lambda(pad_to_16)
+])
+
+class DIV2KDataset(Dataset):
+    def __init__(self, root, train=True, transform=None, repeat=10):
+        self.transform = transform
+        self.img_paths = []
+        self.repeat = repeat if train else 1
+
+        if train:
+            folder = os.path.join(root, "DIV2K_train_HR")
+        else:
+            folder = os.path.join(root, "DIV2K_valid_HR")
+
+        for name in os.listdir(folder):
+            if name.endswith(('png', 'jpg')):
+                self.img_paths.append(os.path.join(folder, name))
+
+    def __len__(self):
+        return len(self.img_paths) * self.repeat
+
+    def __getitem__(self, idx):
+        actual_idx = idx % len(self.img_paths)
+        img = Image.open(self.img_paths[actual_idx]).convert('L')
+        if self.transform:
+            img = self.transform(img)
+        return img, 0
+
+def add_noise(image, sigma=25):
+    noise = torch.randn_like(image) * (sigma / 255.0)
+    noisy = image + noise
+    noisy = torch.clamp(noisy, 0.0, 1.0)
+    return noisy
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=1, out_channels=1):
+        super().__init__()
+
+        #编码器
+        self.enc1 = self.conv_block(in_channels, 64)
+        self.enc2 = self.conv_block(64, 128)
+        self.enc3 = self.conv_block(128, 256)
+        self.enc4 = self.conv_block(256, 512)
+
+        self.pool = nn.MaxPool2d(2)
+
+        #底部
+        self.bottleneck = self.conv_block(512, 1024)
+
+        #解码器
+        self.up4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec4 = self.conv_block(1024, 512)
+
+        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec3 = self.conv_block(512, 256)
+
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = self.conv_block(256, 128)
+
+        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = self.conv_block(128, 64)
+
+        #输出
+        self.out = nn.Conv2d(64, out_channels, 1)
+
+    def conv_block(self, in_ch, out_ch):
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+
+        identity = x
+
+        #编码
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        #底部
+        b = self.bottleneck(self.pool(e4))
+
+        #解码 + 跳跃连接
+        d4 = self.up4(b)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        noise_pred = self.out(d1)
+
+        return identity - noise_pred
+
+def train(model, criterion, optimizer, loader, epoch):
+    model.train()
+    total_loss = 0
+    total_psnr = 0
+    total_imgs = 0
+    start = time.time()
+
+    for data, _ in loader:
+        clean = data.to(device)
+        noisy = add_noise(clean, sigma)
+
+        optimizer.zero_grad()
+
+        denoised = model(noisy)
+        loss = criterion(denoised, clean)
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            denoised_clamped = torch.clamp(denoised, 0.0, 1.0)
+            mse = torch.mean((denoised_clamped - clean) ** 2, dim=[1, 2, 3])
+            batch_psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
+            total_psnr += batch_psnr.sum().item()
+
+        total_loss += loss.item() * clean.size(0)
+        total_imgs += clean.size(0)
+
+    avg_loss = total_loss / total_imgs
+    avg_psnr = total_psnr / total_imgs
+    cost = time.time() - start
+
+    writer.add_scalar("Train/Loss", avg_loss, epoch)
+    writer.add_scalar("Train/PSNR", avg_psnr, epoch)
+
+    print(f"Epoch {epoch + 1:2d} | Loss {avg_loss:.4f} | PSNR {avg_psnr:.2f} dB | {cost:.1f}s")
+    return avg_psnr, 0.0
+
+
+def test(model, loader):
+    model.eval()
+    total_psnr = 0
+    total_ssim = 0
+    total_imgs = 0
+
+    with torch.no_grad():
+        for data, _ in loader:
+            clean = data.to(device)
+            noisy = add_noise(clean, sigma=25)
+            denoised = model(noisy)
+            denoised = torch.clamp(denoised, 0.0, 1.0)
+
+            clean_np = clean.cpu().numpy()
+            denoised_np = denoised.cpu().numpy()
+
+            for c, d in zip(clean_np, denoised_np):
+                c = c.squeeze()
+                d = d.squeeze()
+                total_psnr += psnr(c, d, data_range=1)
+                total_ssim += ssim(c, d, data_range=1, channel_axis=None)
+            total_imgs += clean.size(0)
+
+    avg_psnr = total_psnr / total_imgs
+    avg_ssim = total_ssim / total_imgs
+
+    print(f"测试PSNR: {avg_psnr:.2f} dB   SSIM: {avg_ssim:.4f}\n")
+    return avg_psnr, avg_ssim
+
+if __name__ == "__main__":
+    train_set = DIV2KDataset(div2k_path, train=True, transform=train_transform, repeat=10)
+    test_set = DIV2KDataset(div2k_path, train=False, transform=test_transform)
+
+    train_loader = DataLoader(train_set,batch_size=batch_size,shuffle=True,num_workers=8,pin_memory=True)
+    test_loader = DataLoader(test_set,batch_size=1,shuffle=False,num_workers=8,pin_memory=True)
+
+    model = UNet(in_channels=1, out_channels=1).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
+
+    best_psnr = 0.0
+    best_ssim = 0.0
+    best_ssim_epoch = 0
+    best_psnr_epoch = 0
+
+    print("开始训练\n")
+
+    for epoch in range(epochs):
+        train_psnr, train_ssim = train(model, criterion, optimizer, train_loader, epoch)
+        test_psnr, test_ssim = test(model, test_loader)
+
+        scheduler.step()
+
+        if test_psnr > best_psnr:
+            best_psnr = test_psnr
+            best_psnr_epoch = epoch
+            torch.save(model.state_dict(), os.path.join(model_path, "unet_best.pth"))
+            print(f"模型已保存 | Best PSNR = {best_psnr:.2f} dB\n")
+        if test_ssim > best_ssim:
+            best_ssim = test_ssim
+            best_ssim_epoch = epoch
+
+    print(f"Best PSNR: {best_psnr:.2f} dB in {best_psnr_epoch + 1:2d} epoch\n ")
+    print(f"Best SSIM: {best_ssim:.4f} in {best_ssim_epoch + 1:2d} epoch\n")
+    writer.close()
