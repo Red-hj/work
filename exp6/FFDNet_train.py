@@ -1,33 +1,35 @@
 import os
-import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 import time
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
-from torch.utils.data import Dataset
+from PIL import Image
 
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 log_dir = r"E:\explore\FFDNet\logs_train"
 result_dir = r"E:\explore\FFDNet\result"
 model_path = r"E:\explore\FFDNet\model"
+div2k_path = r"E:\explore\data\DIV2K"
+
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(result_dir, exist_ok=True)
+os.makedirs(model_path, exist_ok=True)
 
 batch_size = 32
 epochs = 100
 learning_rate = 1e-3
-weight_decay = 1e-4
-sigma_min = 5
-sigma_max = 50
-salt_pepper_amount = 0.03
-
+weight_decay = 0
+sigma = 25
+repeat = 10
 
 writer = SummaryWriter(log_dir=log_dir)
+
 
 def pad_to_even(x):
     h, w = x.shape[-2:]
@@ -35,187 +37,203 @@ def pad_to_even(x):
     pad_w = (2 - w % 2) % 2
     return nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
 
-transform = transforms.Compose([
+
+train_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((64, 64)),
+    transforms.RandomCrop(128),
     transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,)),
     transforms.Lambda(pad_to_even)
 ])
 
-train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+test_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.CenterCrop(256),
+    transforms.ToTensor(),
+    transforms.Lambda(pad_to_even)
+])
 
-def add_noisy(image, sigma=25):
-    if isinstance(image, torch.Tensor):
-        img_np = image.cpu().numpy().squeeze(1)
-    else:
-        img_np = image.copy()
 
-    gaussian_noise = np.random.normal(0, sigma / 255.0, img_np.shape)
-    noisy_img = img_np + gaussian_noise
-    noisy_img = np.clip(noisy_img, -1, 1)
+class DIV2KDataset(Dataset):
+    def __init__(self, root, train=True, transform=None, repeat=10):
+        self.transform = transform
+        self.img_paths = []
+        self.repeat = repeat if train else 1
 
-    if isinstance(image, torch.Tensor):
-        ans = torch.from_numpy(noisy_img).unsqueeze(1).float().to(device)
-        return ans
-    return noisy_img
+        folder = os.path.join(root, "DIV2K_train_HR" if train else "DIV2K_valid_HR")
+
+        for name in os.listdir(folder):
+            if name.endswith(('png', 'jpg')):
+                self.img_paths.append(os.path.join(folder, name))
+
+    def __len__(self):
+        return len(self.img_paths) * self.repeat
+
+    def __getitem__(self, idx):
+        actual_idx = idx % len(self.img_paths)
+        img = Image.open(self.img_paths[actual_idx]).convert('L')
+        if self.transform:
+            img = self.transform(img)
+        return img, 0
+
 
 class FFDNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, num_features=64):
         super(FFDNet, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels * 4 + 1, num_features, kernel_size=3, padding=1, bias=False)
-        self.relu1 = nn.ReLU(inplace=True)
-        layers = []
 
-        for _ in range(18):
-            layers.append(nn.Conv2d(num_features, num_features, kernel_size=3, padding=1, bias=False))
+        self.pixel_unshuffle = nn.PixelUnshuffle(2)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+
+        self.conv1 = nn.Conv2d(in_channels * 4 + 1, num_features, 3, padding=1, bias=True)
+        self.relu = nn.ReLU(inplace=True)
+
+        layers = []
+        for _ in range(13):
+            layers.append(nn.Conv2d(num_features, num_features, 3, padding=1, bias=False))
             layers.append(nn.BatchNorm2d(num_features))
             layers.append(nn.ReLU(inplace=True))
-
         self.body = nn.Sequential(*layers)
-        self.conv_last = nn.Conv2d(num_features, out_channels * 4, kernel_size=3, padding=1, bias=False)
+
+        self.conv_last = nn.Conv2d(num_features, out_channels * 4, 3, padding=1, bias=True)
+
         self._initialize_weights()
 
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.orthogonal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x_and_sigma):
-        x, sigma = x_and_sigma
-        batch_size, in_channels, h, w = x.size()
+    def forward(self, x, sigma):
+        x = self.pixel_unshuffle(x)
 
-        x = x.view(batch_size, in_channels, h // 2, 2, w // 2, 2)
-        x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
-        x = x.view(batch_size, in_channels * 4, h // 2, w // 2)
-        sigma_map = sigma.repeat(1, 1, h // 2, w // 2)
-        x = torch.cat((x, sigma_map), 1)
-        x = self.relu1(self.conv1(x))
+        sigma_map = sigma.expand(x.size(0), 1, x.size(2), x.size(3))
+        x = torch.cat([x, sigma_map], dim=1)
+
+        x = self.relu(self.conv1(x))
         x = self.body(x)
         x = self.conv_last(x)
 
-        out_channels = x.size(1) // 4
-        x = x.view(batch_size, out_channels, 2, 2, h // 2, w // 2)
-        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
-        x = x.view(batch_size, out_channels, h, w)
-
+        x = self.pixel_shuffle(x)
         return x
 
-def train(model, criterion, optimizer, train_loader, epoch):
+
+def train(model, criterion, optimizer, loader, epoch):
     model.train()
+    total_loss = 0
+    total_psnr = 0
+    total_imgs = 0
+    start = time.time()
 
-    epoch_start = time.time()
-    train_psnr = 0.0
-    train_ssim = 0.0
-    batch_count = 0
+    for data, _ in loader:
+        clean = data.to(device)
 
-    for batch_idx, (data, _) in enumerate(train_loader):
-        clean_img = data.to(device)
-        sigma_val = np.random.uniform(sigma_min, sigma_max)
-        noisy_img = add_noisy(clean_img, sigma_val)
-        sigma_tensor = torch.full((clean_img.size(0), 1, 1, 1), sigma_val / 255.0).to(device)
-        denoised_img = model((noisy_img, sigma_tensor))
-        loss = criterion(denoised_img, clean_img)
+        noise = torch.randn_like(clean) * (sigma / 255.0)
+        noisy = clean + noise
+
+        sigma_tensor = torch.full((clean.size(0), 1, 1, 1), sigma / 255.0, device=device)
+
         optimizer.zero_grad()
+        noise_pred = model(noisy, sigma_tensor)
+
+        loss = criterion(noise_pred, noise)
         loss.backward()
         optimizer.step()
-        clean_np = (clean_img.cpu().detach().numpy() + 1) / 2
-        denoised_np = (denoised_img.cpu().detach().numpy() + 1) / 2
 
-        for c, d in zip(clean_np, denoised_np):
-            c = c.squeeze()
-            d = d.squeeze()
-            train_psnr += psnr(c, d, data_range=1.0)
-            train_ssim += ssim(c, d, data_range=1.0, channel_axis=None)
+        with torch.no_grad():
+            denoised = noisy - noise_pred
+            denoised_clamped = torch.clamp(denoised, 0.0, 1.0)
 
-        batch_count += 1
+            mse = torch.mean((denoised_clamped - clean) ** 2, dim=[1, 2, 3])
+            batch_psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
+            total_psnr += batch_psnr.sum().item()
 
-    avg_train_psnr = train_psnr / (batch_count * batch_size)
-    avg_train_ssim = train_ssim / (batch_count * batch_size)
+        total_loss += loss.item() * clean.size(0)
+        total_imgs += clean.size(0)
 
-    epoch_time = round(time.time() - epoch_start, 4)
+    avg_loss = total_loss / total_imgs
+    avg_psnr = total_psnr / total_imgs
+    cost = time.time() - start
 
-    writer.add_scalar('Train/Loss', loss.item(), epoch)
-    writer.add_scalar('Train/PSNR', avg_train_psnr, epoch)
-    writer.add_scalar('Train/SSIM', avg_train_ssim, epoch)
-    writer.add_scalar('Train/Epoch_Time', epoch_time, epoch)
+    writer.add_scalar("Train/Loss", avg_loss, epoch)
+    writer.add_scalar("Train/PSNR", avg_psnr, epoch)
+    print(f"Epoch {epoch + 1:2d} | Loss {avg_loss:.6f} | PSNR {avg_psnr:.2f} dB | {cost:.1f}s")
+    return avg_psnr
 
-    print(f"第 {epoch + 1}轮训练\n")
-    print(f"Loss: {loss.item():.4f}   PSNR: {avg_train_psnr:.2f} dB   SSIM: {avg_train_ssim:.4f}\n")
-    print(f"训练耗时: {epoch_time:.4f} s\n")
 
-    return avg_train_psnr, avg_train_ssim
-
-def test(model, criterion, test_loader):
+def test(model, loader):
     model.eval()
-
-    test_psnr = 0.0
-    test_ssim = 0.0
-    img_count = 0
+    total_psnr = 0
+    total_ssim = 0
+    total_imgs = 0
 
     with torch.no_grad():
-        for batch_idx, (data, _) in enumerate(test_loader):
-            clean_img = data.to(device)
-            sigma_test = 35
-            noisy_img = add_noisy(clean_img, sigma_test)
-            noisy_img_save = noisy_img
-            sigma_tensor = torch.full((clean_img.size(0), 1, 1, 1), sigma_test / 255.0).to(device)
-            denoised_img = model((noisy_img, sigma_tensor))
-            clean_np = (clean_img[0].cpu().numpy().squeeze() + 1) / 2 * 255
-            noisy_np = (noisy_img_save[0].cpu().numpy().squeeze() + 1) / 2 * 255
-            denoised_np = (denoised_img[0].cpu().numpy().squeeze() + 1) / 2 * 255
-            cv2.imwrite(os.path.join(result_dir, f"test_clean_{batch_idx}.png"), clean_np.astype(np.uint8))
-            cv2.imwrite(os.path.join(result_dir, f"test_noisy_{batch_idx}.png"), noisy_np.astype(np.uint8))
-            cv2.imwrite(os.path.join(result_dir, f"test_denoised_{batch_idx}.png"), denoised_np.astype(np.uint8))
-            clean_np = (clean_img.cpu().numpy() + 1) / 2
-            denoised_np = (denoised_img.cpu().numpy() + 1) / 2
+        for data, _ in loader:
+            clean = data.to(device)
+
+            noise = torch.randn_like(clean) * (sigma / 255.0)
+            noisy = clean + noise
+
+            sigma_tensor = torch.full((clean.size(0), 1, 1, 1), sigma / 255.0, device=device)
+            noise_pred = model(noisy, sigma_tensor)
+
+            denoised = noisy - noise_pred
+            denoised = torch.clamp(denoised, 0.0, 1.0)
+
+            clean_np = clean.cpu().numpy()
+            denoised_np = denoised.cpu().numpy()
 
             for c, d in zip(clean_np, denoised_np):
                 c = c.squeeze()
                 d = d.squeeze()
-                test_psnr += psnr(c, d, data_range=1.0)
-                test_ssim += ssim(c, d, data_range=1.0, channel_axis=None)
+                total_psnr += psnr(c, d, data_range=1.0)
+                total_ssim += ssim(c, d, data_range=1.0, channel_axis=None)
+            total_imgs += clean.size(0)
 
-            img_count += 1
+    avg_psnr = total_psnr / total_imgs
+    avg_ssim = total_ssim / total_imgs
+    print(f"测试PSNR: {avg_psnr:.2f} dB   SSIM: {avg_ssim:.4f}\n")
+    return avg_psnr, avg_ssim
 
-    avg_test_psnr = test_psnr / (img_count * batch_size)
-    avg_test_ssim = test_ssim / (img_count * batch_size)
-    print(f"----测试 PSNR: {avg_test_psnr:.2f} dB  SSIM: {avg_test_ssim:.4f}")
-    return avg_test_psnr, avg_test_ssim
 
 if __name__ == "__main__":
-    model = FFDNet(in_channels=1, out_channels=1).to(device)
+    train_set = DIV2KDataset(div2k_path, train=True, transform=train_transform, repeat=repeat)
+    test_set = DIV2KDataset(div2k_path, train=False, transform=test_transform)
 
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=8, pin_memory=True)
+
+    model = FFDNet().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    print("开始训练...")
-    total_train_time = time.time()
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+    best_psnr = 0.0
+    best_ssim = 0.0
+    best_ssim_epoch = 0
+    best_psnr_epoch = 0
+    print("开始训练\n")
 
     for epoch in range(epochs):
-        avg_train_psnr, avg_train_ssim = train(model, criterion, optimizer, train_loader, epoch)
+        train_psnr = train(model, criterion, optimizer, train_loader, epoch)
+        test_psnr, test_ssim = test(model, test_loader)
 
-    total_train_time = round(time.time() - total_train_time, 4)
-    writer.add_scalar('Train/Total_Time', total_train_time)
-    print(f"总时长: {total_train_time:.4f} s")
-    torch.save(model.state_dict(), os.path.join(model_path, "ffdnet.pth"))
-    print("\n开始测试...")
-    avg_test_psnr, avg_test_ssim = test(model, criterion, test_loader)
-    writer.add_hparams({
-        'lr': learning_rate,
-        'batch_size': batch_size,
-        'sigma_min': sigma_min,
-        'sigma_max': sigma_max
-    }, {
-        'final_train_psnr': avg_train_psnr,
-        'final_train_ssim': avg_train_ssim,
-        'final_test_psnr': avg_test_psnr,
-        'final_test_ssim': avg_test_ssim
-    })
+        scheduler.step()
+
+        if test_psnr > best_psnr:
+            best_psnr = test_psnr
+            best_psnr_epoch = epoch
+            torch.save(model.state_dict(), os.path.join(model_path, "ffdnet_best.pth"))
+            print(f"模型已保存 | Best PSNR = {best_psnr:.2f} dB\n")
+
+        if test_ssim > best_ssim:
+            best_ssim = test_ssim
+            best_ssim_epoch = epoch
+
+    print(f"Best PSNR: {best_psnr:.2f} dB in {best_psnr_epoch + 1:2d} epoch")
+    print(f"Best SSIM: {best_ssim:.4f} in {best_ssim_epoch + 1:2d} epoch")
     writer.close()
